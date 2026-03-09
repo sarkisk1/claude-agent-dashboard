@@ -114,8 +114,10 @@ class AgentDashboard {
     if (!(await fs.pathExists(leadFilePath))) return false;
 
     try {
-      const content = await fs.readFile(leadFilePath, 'utf8');
-      return content.includes('"TeamCreate"') || content.includes('"SendMessage"');
+      // Only read first 50 lines instead of entire file — team protocol markers appear early
+      const lines = await this.readFirstNLines(leadFilePath, 50);
+      const sample = lines.join('\n');
+      return sample.includes('"TeamCreate"') || sample.includes('"SendMessage"');
     } catch (e) {
       return false;
     }
@@ -274,12 +276,17 @@ class AgentDashboard {
   }
 
   async parseFullSession(sessionId) {
-    if (this.sessionCache.has(sessionId)) {
-      return this.sessionCache.get(sessionId);
-    }
-
     const session = this.sessions.find(s => s.id === sessionId);
     if (!session) return null;
+
+    // Check cache validity: compare file modification times
+    if (this.sessionCache.has(sessionId)) {
+      const cached = this.sessionCache.get(sessionId);
+      const staleCheck = await this.isSessionStale(session, cached._cachedAt);
+      if (!staleCheck) {
+        return cached;
+      }
+    }
 
     const events = [];
     const agents = new Map();
@@ -319,8 +326,22 @@ class AgentDashboard {
       agentEventMap.set(agentId, agentEvents);
     }
 
-    // Resolve agent names
-    const nameMap = this.resolveAgentNames(events, agentEventMap);
+    // Resolve agent names and types
+    const { nameMap, typeMap } = this.resolveAgentNames(events, agentEventMap);
+
+    // Read .meta.json files for agent types not resolved from tool calls
+    for (const agentFile of session.agentFiles) {
+      const agentId = agentFile.replace('agent-', '').replace('.jsonl', '');
+      if (!typeMap.has(agentId)) {
+        const metaPath = path.join(session.subagentsDir, agentFile.replace('.jsonl', '.meta.json'));
+        try {
+          if (await fs.pathExists(metaPath)) {
+            const meta = await fs.readJson(metaPath);
+            if (meta.agentType) typeMap.set(agentId, meta.agentType);
+          }
+        } catch (e) { /* skip */ }
+      }
+    }
 
     // Build agent info
     for (const [agentId, agentEvents] of agentEventMap) {
@@ -361,9 +382,26 @@ class AgentDashboard {
         }
       }
 
+      // Extract task name from first user message if no name resolved
+      let inferredName = null;
+      if (!resolvedName && !taskSubject) {
+        for (const evt of agentEvents) {
+          if (evt.type === 'user' && evt.textContent) {
+            const text = evt.textContent.trim();
+            if (text.startsWith('<teammate-message') || text.startsWith('<system') || text.startsWith('<hook')) continue;
+            // Extract first meaningful line as task name (strip markdown headers)
+            const firstLine = text.split('\n').find(l => l.trim().length > 5) || '';
+            inferredName = firstLine.replace(/^#+\s*/, '').replace(/^(Task|Goal|Objective):\s*/i, '').substring(0, 60).trim();
+            if (inferredName.length > 50) inferredName = inferredName.substring(0, 48) + '..';
+            break;
+          }
+        }
+      }
+
       agents.set(agentId, {
         id: agentId,
-        name: resolvedName || taskSubject || (spawnedBy ? `${spawnedBy}/${agentId.substring(0, 4)}` : agentId.substring(0, 7)),
+        name: resolvedName || taskSubject || inferredName || (spawnedBy ? `${spawnedBy}/${agentId.substring(0, 4)}` : agentId.substring(0, 7)),
+        subagentType: typeMap.get(agentId) || null,
         eventCount: agentEvents.length,
         startTime: agentStart,
         endTime: agentEnd,
@@ -390,8 +428,37 @@ class AgentDashboard {
       stats: this.calculateSessionStats(events, agents)
     };
 
+    result._cachedAt = Date.now();
     this.sessionCache.set(sessionId, result);
     return result;
+  }
+
+  async isSessionStale(session, cachedAt) {
+    if (!cachedAt) return true;
+
+    // Always re-parse if cached less than 10 seconds ago and session is recent
+    const sessionAge = Date.now() - new Date(session.endTime || session.startTime).getTime();
+    if (sessionAge < 300000) return true; // Sessions < 5 min old are always re-parsed
+
+    try {
+      // Check if lead file was modified after cache
+      const leadFile = session.path + '.jsonl';
+      if (await fs.pathExists(leadFile)) {
+        const stat = await fs.stat(leadFile);
+        if (stat.mtimeMs > cachedAt) return true;
+      }
+
+      // Check if any agent file was modified after cache
+      for (const agentFile of session.agentFiles) {
+        const filePath = path.join(session.subagentsDir, agentFile);
+        const stat = await fs.stat(filePath);
+        if (stat.mtimeMs > cachedAt) return true;
+      }
+
+      return false;
+    } catch (e) {
+      return true; // On error, assume stale
+    }
   }
 
   resolveAgentNames(allEvents, agentEventMap) {
@@ -460,7 +527,15 @@ class AgentDashboard {
       }
     }
 
-    return nameMap;
+    // Build a type map from agentToolCalls
+    const typeMap = new Map();
+    for (const [, callInfo] of agentToolCalls) {
+      if (callInfo.resolvedAgentId && callInfo.subagentType) {
+        typeMap.set(callInfo.resolvedAgentId, callInfo.subagentType);
+      }
+    }
+
+    return { nameMap, typeMap };
   }
 
   async parseJSONLFile(filePath, agentId) {
@@ -484,6 +559,16 @@ class AgentDashboard {
           const toolUseBlocks = contentBlocks.filter(b => b.type === 'tool_use');
           const toolResultBlocks = contentBlocks.filter(b => b.type === 'tool_result');
 
+          // Capture token usage from assistant messages
+          const usage = (parsed.type === 'assistant' && msg.usage) ? {
+            input: msg.usage.input_tokens || 0,
+            output: msg.usage.output_tokens || 0,
+            cacheRead: msg.usage.cache_read_input_tokens || 0,
+            cacheWrite: msg.usage.cache_creation_input_tokens || 0,
+            cacheWrite5m: msg.usage.cache_creation?.ephemeral_5m_input_tokens || 0,
+            cacheWrite1h: msg.usage.cache_creation?.ephemeral_1h_input_tokens || 0,
+          } : null;
+
           events.push({
             agentId: parsed.agentId || agentId,
             type: parsed.type,
@@ -491,6 +576,7 @@ class AgentDashboard {
             timestamp: parsed.timestamp,
             textContent: textContent.substring(0, 2000),
             hasText: textContent.length > 0,
+            usage,
             toolUse: toolUseBlocks.map(t => ({
               name: t.name,
               id: t.id,
@@ -518,7 +604,8 @@ class AgentDashboard {
               return {
                 tool_use_id: t.tool_use_id,
                 content: resultContent.substring(0, 2000),
-                agentId: agentIdMeta
+                agentId: agentIdMeta,
+                isError: !!t.is_error
               };
             }),
             model: msg.model,
@@ -721,13 +808,356 @@ class AgentDashboard {
       }
     }
 
+    // Efficiency metrics
+    const lead = agents.get('lead');
+    const leadTools = lead ? Object.values(lead.toolsUsed || {}).reduce((s, v) => s + v, 0) : 0;
+    const subagentTools = toolUsages - leadTools;
+    const efficiencyScore = toolUsages > 0 ? Math.round((subagentTools / toolUsages) * 100) : 0;
+
+    // Lead timeline phases
+    let leadPlanningEnd = null;   // When first agent starts
+    let leadWaitingEnd = null;    // When last agent ends
+    const leadStart = lead?.startTime ? new Date(lead.startTime).getTime() : null;
+    const leadEnd = lead?.endTime ? new Date(lead.endTime).getTime() : null;
+
+    for (const [id, agent] of agents) {
+      if (id === 'lead') continue;
+      const aStart = agent.startTime ? new Date(agent.startTime).getTime() : null;
+      const aEnd = agent.endTime ? new Date(agent.endTime).getTime() : null;
+      if (aStart && (!leadPlanningEnd || aStart < leadPlanningEnd)) leadPlanningEnd = aStart;
+      if (aEnd && (!leadWaitingEnd || aEnd > leadWaitingEnd)) leadWaitingEnd = aEnd;
+    }
+
+    const leadPhases = {};
+    if (leadStart && leadEnd) {
+      const total = leadEnd - leadStart;
+      leadPhases.planning = leadPlanningEnd ? Math.max(0, leadPlanningEnd - leadStart) : 0;
+      leadPhases.waiting = (leadPlanningEnd && leadWaitingEnd) ? Math.max(0, leadWaitingEnd - leadPlanningEnd) : 0;
+      leadPhases.postAgent = leadWaitingEnd ? Math.max(0, leadEnd - leadWaitingEnd) : 0;
+      leadPhases.planningPct = total > 0 ? (leadPhases.planning / total) * 100 : 0;
+      leadPhases.waitingPct = total > 0 ? (leadPhases.waiting / total) * 100 : 0;
+      leadPhases.postAgentPct = total > 0 ? (leadPhases.postAgent / total) * 100 : 0;
+    }
+
+    // Per-agent read/write ratios
+    const agentRatios = {};
+    for (const [id, agent] of agents) {
+      const used = agent.toolsUsed || {};
+      const total = Object.values(used).reduce((s, v) => s + v, 0);
+      const writes = (used.Edit || 0) + (used.Write || 0);
+      const reads = (used.Read || 0) + (used.Grep || 0) + (used.Glob || 0);
+      agentRatios[id] = {
+        total,
+        writes,
+        reads,
+        writePct: total > 0 ? Math.round((writes / total) * 100) : 0,
+        readPct: total > 0 ? Math.round((reads / total) * 100) : 0
+      };
+    }
+
+    // Per-agent token usage (moved before new metrics so costPerAgent can reference it)
+    const agentTokens = {};
+    for (const [id] of agents) {
+      const agentEvents = events.filter(e => e.agentId === id);
+      let aInput = 0, aOutput = 0, aCacheRead = 0, aCacheWrite = 0;
+      for (const event of agentEvents) {
+        if (event.usage) {
+          aInput += event.usage.input;
+          aOutput += event.usage.output;
+          aCacheRead += event.usage.cacheRead;
+          aCacheWrite += event.usage.cacheWrite;
+        }
+      }
+      const aTotal = aInput + aOutput + aCacheRead + aCacheWrite;
+      if (aTotal > 0) {
+        agentTokens[id] = { input: aInput, output: aOutput, cacheRead: aCacheRead, cacheWrite: aCacheWrite, total: aTotal };
+      }
+    }
+
+    // GBP conversion rate used by multiple cost metrics below
+    const GBP_RATE = 0.79;
+
+    // 1. Parallelism Score
+    const agentIntervals = [];
+    for (const [id, agent] of agents) {
+      if (id === 'lead') continue;
+      const s = agent.startTime ? new Date(agent.startTime).getTime() : null;
+      const e = agent.endTime ? new Date(agent.endTime).getTime() : null;
+      if (s && e) agentIntervals.push({ start: s, end: e });
+    }
+    let parallelismScore = 0, peakConcurrency = 0;
+    if (agentIntervals.length >= 2) {
+      const minStart = Math.min(...agentIntervals.map(a => a.start));
+      const maxEnd = Math.max(...agentIntervals.map(a => a.end));
+      const step = Math.max(1000, Math.floor((maxEnd - minStart) / 500));
+      let parallelSamples = 0, totalSamples = 0;
+      for (let t = minStart; t <= maxEnd; t += step) {
+        const active = agentIntervals.filter(a => t >= a.start && t <= a.end).length;
+        if (active > 0) totalSamples++;
+        if (active >= 2) parallelSamples++;
+        if (active > peakConcurrency) peakConcurrency = active;
+      }
+      parallelismScore = totalSamples > 0 ? Math.round((parallelSamples / totalSamples) * 100) : 0;
+    }
+    const parallelism = { score: parallelismScore, peakConcurrency, agentCount: agentIntervals.length };
+
+    // 2. Lead Post-Agent Tools
+    const leadPostAgentTools = {};
+    let leadPostAgentCalls = 0;
+    if (leadWaitingEnd) {
+      for (const event of events.filter(e => e.agentId === 'lead')) {
+        const ts = new Date(event.timestamp).getTime();
+        if (ts > leadWaitingEnd) {
+          for (const tool of event.toolUse || []) {
+            leadPostAgentTools[tool.name] = (leadPostAgentTools[tool.name] || 0) + 1;
+            leadPostAgentCalls++;
+          }
+        }
+      }
+    }
+    const leadPostAgent = { tools: leadPostAgentTools, totalCalls: leadPostAgentCalls };
+
+    // 3. Agent Autonomy Score
+    const agentAutonomy = {};
+    const productiveTools = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
+    const investigationTools = new Set(['Read', 'Grep', 'Glob', 'LS']);
+    for (const [id, agent] of agents) {
+      const used = agent.toolsUsed || {};
+      let productive = 0, investigation = 0, other = 0;
+      for (const [name, count] of Object.entries(used)) {
+        if (productiveTools.has(name)) productive += count;
+        else if (investigationTools.has(name)) investigation += count;
+        else other += count;
+      }
+      const total = productive + investigation + other;
+      agentAutonomy[id] = {
+        productive, investigation, other, total,
+        score: total > 0 ? Math.round((productive / total) * 100) : 0
+      };
+    }
+
+    // 4. Duplicate Work Detection + 12. File Heatmap
+    const fileAccess = {};
+    for (const event of events) {
+      const agentId = event.agentId || 'lead';
+      for (const tool of event.toolUse || []) {
+        let filePath = null;
+        let isWrite = false;
+        if (tool.name === 'Read' && tool.input?.file_path) filePath = tool.input.file_path;
+        else if (tool.name === 'Grep' && tool.input?.path) filePath = tool.input.path;
+        else if (tool.name === 'Edit' && tool.input?.file_path) { filePath = tool.input.file_path; isWrite = true; }
+        else if (tool.name === 'Write' && tool.input?.file_path) { filePath = tool.input.file_path; isWrite = true; }
+        else if (tool.name === 'MultiEdit' && tool.input?.file_path) { filePath = tool.input.file_path; isWrite = true; }
+        if (filePath) {
+          if (!fileAccess[filePath]) fileAccess[filePath] = { agents: new Set(), count: 0, reads: 0, writes: 0 };
+          fileAccess[filePath].agents.add(agentId);
+          fileAccess[filePath].count++;
+          if (isWrite) fileAccess[filePath].writes++; else fileAccess[filePath].reads++;
+        }
+      }
+    }
+    const duplicateFiles = Object.entries(fileAccess)
+      .filter(([, v]) => v.agents.size >= 2)
+      .map(([p, v]) => ({ path: p, agents: [...v.agents], count: v.count }))
+      .sort((a, b) => b.agents.length - a.agents.length);
+    const duplicateWork = { files: duplicateFiles.slice(0, 20), count: duplicateFiles.length };
+    const fileHeatmap = Object.entries(fileAccess)
+      .map(([p, v]) => ({ path: p, count: v.count, reads: v.reads, writes: v.writes, agents: [...v.agents] }))
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 30);
+
+    // 5. Cost Per Agent
+    const costPerAgent = {};
+    for (const [id, at] of Object.entries(agentTokens)) {
+      const inCost = at.input * 5 / 1_000_000;
+      const outCost = at.output * 25 / 1_000_000;
+      const cacheCost = at.cacheRead * 0.50 / 1_000_000 + at.cacheWrite * 10 / 1_000_000;
+      const totalUSD = inCost + outCost + cacheCost;
+      const totalGBP = totalUSD * GBP_RATE;
+      const agentInfo = agents.get(id);
+      const totalAgentTools = agentInfo ? Object.values(agentInfo.toolsUsed || {}).reduce((s, v) => s + v, 0) : 0;
+      const edits = agentInfo ? ((agentInfo.toolsUsed || {}).Edit || 0) + ((agentInfo.toolsUsed || {}).Write || 0) : 0;
+      costPerAgent[id] = {
+        costGBP: Math.round(totalGBP * 100) / 100,
+        costUSD: Math.round(totalUSD * 100) / 100,
+        costPerTool: totalAgentTools > 0 ? Math.round((totalGBP / totalAgentTools) * 100) / 100 : 0,
+        costPerEdit: edits > 0 ? Math.round((totalGBP / edits) * 100) / 100 : 0
+      };
+    }
+
+    // 7. Prompt Lengths
+    const promptLengths = {};
+    for (const event of events.filter(e => e.agentId === 'lead')) {
+      for (const tool of event.toolUse || []) {
+        if (tool.name === 'Agent' && tool.input?.prompt) {
+          const prompt = tool.input.prompt;
+          const desc = tool.input.description || '';
+          promptLengths[tool.id] = { chars: prompt.length, words: prompt.split(/\s+/).length, description: desc };
+        }
+      }
+    }
+
+    // 8. Time to First Edit
+    const timeToFirstEdit = {};
+    for (const [id, agent] of agents) {
+      if (id === 'lead') continue;
+      const agentStart = agent.startTime ? new Date(agent.startTime).getTime() : null;
+      if (!agentStart) continue;
+      const agentEvts = events.filter(e => e.agentId === id);
+      for (const evt of agentEvts) {
+        for (const tool of evt.toolUse || []) {
+          if (tool.name === 'Edit' || tool.name === 'Write' || tool.name === 'MultiEdit') {
+            timeToFirstEdit[id] = new Date(evt.timestamp).getTime() - agentStart;
+            break;
+          }
+        }
+        if (timeToFirstEdit[id] != null) break;
+      }
+      if (timeToFirstEdit[id] == null) timeToFirstEdit[id] = -1;
+    }
+
+    // 9. Error Count
+    const errorCounts = { total: 0, byAgent: {} };
+    for (const event of events) {
+      const aid = event.agentId || 'lead';
+      for (const result of event.toolResults || []) {
+        if (result.isError || (result.content && /^(Error|error:|Exit code [1-9]|FAIL|Command failed)/m.test(result.content))) {
+          errorCounts.total++;
+          errorCounts.byAgent[aid] = (errorCounts.byAgent[aid] || 0) + 1;
+        }
+      }
+    }
+
+    // 10. Model Distribution
+    const modelDistribution = {};
+    for (const event of events) {
+      if (event.model) {
+        modelDistribution[event.model] = (modelDistribution[event.model] || 0) + 1;
+      }
+    }
+
+    // 11. Cumulative Cost Chart
+    const cumulativeCost = [];
+    let runningCost = 0;
+    const sortedUsageEvents = events.filter(e => e.usage).sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+    for (const event of sortedUsageEvents) {
+      const u = event.usage;
+      const cost = (u.input * 5 + u.output * 25 + u.cacheRead * 0.50 + u.cacheWrite * 10) / 1_000_000 * GBP_RATE;
+      runningCost += cost;
+      cumulativeCost.push({ timestamp: event.timestamp, costGBP: Math.round(runningCost * 100) / 100 });
+    }
+    const maxPoints = 50;
+    const costChart = cumulativeCost.length <= maxPoints ? cumulativeCost :
+      cumulativeCost.filter((_, i) => i % Math.ceil(cumulativeCost.length / maxPoints) === 0 || i === cumulativeCost.length - 1);
+
+    // 13. Spawn Latency
+    const spawnLatency = {};
+    const agentToolTimestamps = new Map();
+    for (const event of events.filter(e => e.agentId === 'lead')) {
+      for (const tool of event.toolUse || []) {
+        if (tool.name === 'Agent') {
+          agentToolTimestamps.set(tool.id, new Date(event.timestamp).getTime());
+        }
+      }
+      for (const result of event.toolResults || []) {
+        const spawnTs = agentToolTimestamps.get(result.tool_use_id);
+        if (spawnTs && result.agentId) {
+          const agentFirst = events.find(e => e.agentId === result.agentId);
+          if (agentFirst) {
+            spawnLatency[result.agentId] = new Date(agentFirst.timestamp).getTime() - spawnTs;
+          }
+        }
+      }
+    }
+
+    // 14. Session Tags
+    const sessionTags = [];
+    const allText = events.filter(e => e.type === 'user' && e.agentId === 'lead').map(e => e.textContent || '').join(' ').toLowerCase();
+    if (/\b(fix|bug|broken|error|issue|crash)\b/.test(allText)) sessionTags.push('bug-fix');
+    if (/\b(refactor|cleanup|clean up|reorganize|restructure)\b/.test(allText)) sessionTags.push('refactor');
+    if (/\b(audit|review|analyze|check|inspect)\b/.test(allText)) sessionTags.push('audit');
+    if (/\b(feature|implement|add|create|build|new)\b/.test(allText)) sessionTags.push('feature');
+    if (/\b(test|spec|coverage)\b/.test(allText)) sessionTags.push('testing');
+    if (/\b(deploy|ci|cd|pipeline|vercel|github action)\b/.test(allText)) sessionTags.push('devops');
+    if (/\b(ui|design|style|css|layout|visual|theme)\b/.test(allText)) sessionTags.push('ui');
+    if (/\b(performance|perf|speed|optimize|slow)\b/.test(allText)) sessionTags.push('performance');
+    if (/\b(security|auth|rls|permission|vulnerability)\b/.test(allText)) sessionTags.push('security');
+    if (/\b(migration|migrate|schema|database|supabase)\b/.test(allText)) sessionTags.push('database');
+
+    // Token usage aggregation
+    let totalInput = 0, totalOutput = 0, totalCacheRead = 0, totalCacheWrite = 0;
+    let totalCacheWrite5m = 0, totalCacheWrite1h = 0;
+    for (const event of events) {
+      if (event.usage) {
+        totalInput += event.usage.input;
+        totalOutput += event.usage.output;
+        totalCacheRead += event.usage.cacheRead;
+        totalCacheWrite += event.usage.cacheWrite;
+        totalCacheWrite5m += event.usage.cacheWrite5m;
+        totalCacheWrite1h += event.usage.cacheWrite1h;
+      }
+    }
+
+    // Cost calculation — Claude Opus 4.6 pay-as-you-go rates
+    // Input: $5/MTok, Output: $25/MTok, Cache read: $0.50/MTok
+    // Cache write 5min: $6.25/MTok (1.25x), Cache write 1hr: $10/MTok (2x)
+    const USD_PER_MTOK_INPUT = 5;
+    const USD_PER_MTOK_OUTPUT = 25;
+    const USD_PER_MTOK_CACHE_READ = 0.50;
+    const USD_PER_MTOK_CACHE_WRITE_5M = 6.25;
+    const USD_PER_MTOK_CACHE_WRITE_1H = 10;
+    const USD_TO_GBP = 0.79;
+
+    const inputCost = totalInput * USD_PER_MTOK_INPUT / 1_000_000;
+    const outputCost = totalOutput * USD_PER_MTOK_OUTPUT / 1_000_000;
+    const cacheReadCost = totalCacheRead * USD_PER_MTOK_CACHE_READ / 1_000_000;
+    const cacheWrite5mCost = totalCacheWrite5m * USD_PER_MTOK_CACHE_WRITE_5M / 1_000_000;
+    const cacheWrite1hCost = totalCacheWrite1h * USD_PER_MTOK_CACHE_WRITE_1H / 1_000_000;
+    // Fallback: if no 5m/1h breakdown, price all cache writes at 1hr rate
+    const cacheWriteCost = (totalCacheWrite5m + totalCacheWrite1h > 0)
+      ? cacheWrite5mCost + cacheWrite1hCost
+      : totalCacheWrite * USD_PER_MTOK_CACHE_WRITE_1H / 1_000_000;
+    const totalCostUSD = inputCost + outputCost + cacheReadCost + cacheWriteCost;
+    const totalCostGBP = totalCostUSD * USD_TO_GBP;
+
+    const tokenUsage = {
+      input: totalInput,
+      output: totalOutput,
+      cacheRead: totalCacheRead,
+      cacheWrite: totalCacheWrite,
+      total: totalInput + totalOutput + totalCacheRead + totalCacheWrite,
+      costUSD: Math.round(totalCostUSD * 100) / 100,
+      costGBP: Math.round(totalCostGBP * 100) / 100,
+      breakdown: { inputCost, outputCost, cacheReadCost, cacheWriteCost },
+      agentTokens
+    };
+
     return {
       totalEvents,
       userEvents,
       assistantEvents,
       toolUsages,
       agentCount: agents.size,
-      toolBreakdown
+      toolBreakdown,
+      efficiencyScore,
+      leadTools,
+      subagentTools,
+      leadPhases,
+      agentRatios,
+      tokenUsage,
+      parallelism,
+      leadPostAgent,
+      agentAutonomy,
+      duplicateWork,
+      costPerAgent,
+      promptLengths,
+      timeToFirstEdit,
+      errorCounts,
+      modelDistribution,
+      cumulativeCost: costChart,
+      fileHeatmap,
+      spawnLatency,
+      sessionTags
     };
   }
 
@@ -746,8 +1176,10 @@ class AgentDashboard {
     this.app.get('/api/sessions', async (req, res) => {
       try {
         this.sessions = await this.discoverTeamSessions();
-        res.json({
-          sessions: this.sessions.map(s => ({
+
+        // Compute lightweight efficiency scores for trend sparkline
+        const sessionsWithScores = await Promise.all(this.sessions.map(async (s) => {
+          const base = {
             id: s.id,
             projectName: s.projectName,
             shortProjectName: this.shortProjectName(s.projectName),
@@ -758,8 +1190,24 @@ class AgentDashboard {
             gitBranch: s.gitBranch,
             sessionType: s.sessionType || 'subagent',
             sessionDescription: s.sessionDescription || '',
-            teammateNames: s.teammateNames
-          })),
+            teammateNames: s.teammateNames,
+            efficiencyScore: null
+          };
+          try {
+            const parsed = await this.parseFullSession(s.id);
+            if (parsed?.stats?.efficiencyScore != null) {
+              base.efficiencyScore = parsed.stats.efficiencyScore;
+            }
+            if (parsed?.stats?.tokenUsage) {
+              base.costGBP = parsed.stats.tokenUsage.costGBP;
+              base.totalTokens = parsed.stats.tokenUsage.total;
+            }
+          } catch (e) { /* skip on error */ }
+          return base;
+        }));
+
+        res.json({
+          sessions: sessionsWithScores,
           count: this.sessions.length,
           timestamp: new Date().toISOString()
         });
@@ -878,6 +1326,28 @@ class AgentDashboard {
       }
     });
 
+    // Session comparison
+    this.app.get('/api/compare', async (req, res) => {
+      try {
+        const ids = (req.query.ids || '').split(',').filter(Boolean);
+        if (ids.length < 2) return res.status(400).json({ error: 'Provide 2+ session IDs via ?ids=id1,id2' });
+        const sessions = [];
+        for (const id of ids.slice(0, 3)) {
+          const parsed = await this.parseFullSession(id);
+          if (parsed) {
+            sessions.push({
+              id: parsed.id, projectName: parsed.projectName,
+              startTime: parsed.startTime, duration: parsed.duration,
+              stats: parsed.stats, agents: parsed.agents
+            });
+          }
+        }
+        res.json({ sessions });
+      } catch (error) {
+        res.status(500).json({ error: 'Failed to compare sessions' });
+      }
+    });
+
     // Main route
     this.app.get('/', (req, res) => {
       res.sendFile(path.join(__dirname, 'web', 'index.html'));
@@ -949,3 +1419,10 @@ module.exports = {
   runDashboard,
   AgentDashboard
 };
+
+// Auto-run when executed directly
+if (require.main === module) {
+  const args = process.argv.slice(2);
+  const options = { open: args.includes('--open') };
+  runDashboard(options);
+}
