@@ -26,11 +26,11 @@ class AgentDashboard {
       );
     }
 
-    this.sessions = await this.discoverTeamSessions();
+    this.sessions = await this.discoverAllSessions();
     this.setupWebServer();
   }
 
-  async discoverTeamSessions() {
+  async discoverAllSessions() {
     const sessions = [];
 
     try {
@@ -49,19 +49,30 @@ class AgentDashboard {
           if (!entryStat.isDirectory()) continue;
 
           const subagentsDir = path.join(entryPath, 'subagents');
-          if (!(await fs.pathExists(subagentsDir))) continue;
+          const hasSubagentsDir = await fs.pathExists(subagentsDir);
 
-          const agentFiles = (await fs.readdir(subagentsDir))
-            .filter(f => f.startsWith('agent-') && f.endsWith('.jsonl')
-              && !f.includes('acompact-'));
+          let agentFiles = [];
+          if (hasSubagentsDir) {
+            agentFiles = (await fs.readdir(subagentsDir))
+              .filter(f => f.startsWith('agent-') && f.endsWith('.jsonl')
+                && !f.includes('acompact-'));
+          }
 
-          if (agentFiles.length === 0) continue;
-
-          // Detect team sessions: either native Team protocol OR multi-subagent coordination
+          // Skip truly empty session directories (no lead file and no agent files)
           const leadFile = entryPath + '.jsonl';
-          const isTeam = await this.detectTeamProtocol(leadFile);
-          const isMultiAgent = agentFiles.length >= 2;
-          if (!isTeam && !isMultiAgent) continue;
+          const leadExists = await fs.pathExists(leadFile);
+          if (!leadExists && agentFiles.length === 0) continue;
+
+          const isTeam = leadExists ? await this.detectTeamProtocol(leadFile) : false;
+
+          let sessionType;
+          if (isTeam || agentFiles.length >= 2) {
+            sessionType = 'multi-agent';
+          } else if (agentFiles.length === 1) {
+            sessionType = 'single-agent';
+          } else {
+            sessionType = 'solo';
+          }
 
           const metadata = await this.readSessionMetadata(entryPath, subagentsDir, agentFiles);
 
@@ -73,13 +84,13 @@ class AgentDashboard {
             subagentsDir,
             agentFiles,
             agentCount: agentFiles.length,
-            sessionType: isTeam ? 'team' : 'subagent',
+            sessionType,
             ...metadata
           });
         }
       }
     } catch (error) {
-      console.warn(chalk.yellow('Warning: Error discovering team sessions'), error.message);
+      console.warn(chalk.yellow('Warning: Error discovering sessions'), error.message);
     }
 
     sessions.sort((a, b) => new Date(b.startTime || 0) - new Date(a.startTime || 0));
@@ -1175,7 +1186,7 @@ class AgentDashboard {
     // List all team sessions (lightweight)
     this.app.get('/api/sessions', async (req, res) => {
       try {
-        this.sessions = await this.discoverTeamSessions();
+        this.sessions = await this.discoverAllSessions();
 
         // Compute lightweight efficiency scores for trend sparkline
         const sessionsWithScores = await Promise.all(this.sessions.map(async (s) => {
@@ -1400,7 +1411,8 @@ async function runDashboard(options = {}) {
 
     const sessionCount = dashboard.sessions.length;
     const agentCount = dashboard.sessions.reduce((sum, s) => sum + s.agentCount, 0);
-    console.log(chalk.white(`Found ${sessionCount} multi-agent sessions with ${agentCount} total agents\n`));
+    const multiCount = dashboard.sessions.filter(s => s.sessionType === 'multi-agent').length;
+    console.log(chalk.white(`Found ${sessionCount} sessions (${multiCount} multi-agent, ${agentCount} total agents)\n`));
 
     process.on('SIGINT', () => {
       console.log(chalk.yellow('\nShutting down...'));

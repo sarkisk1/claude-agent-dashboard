@@ -86,7 +86,7 @@ class TeamsDashboardApp {
 
   renderNav() {
     if (!this.sessions.length) {
-      this.nav.innerHTML = '<span class="no-sessions">No team sessions found</span>';
+      this.nav.innerHTML = '<span class="no-sessions">No sessions found</span>';
       return;
     }
 
@@ -112,7 +112,7 @@ class TeamsDashboardApp {
       return `<button class="session-card${i === 0 ? ' active' : ''}" data-id="${s.id}">
         <span class="session-card-header">
           <span class="session-card-project">${this.esc(project)}</span>
-          <span class="session-card-agents">${s.agentCount} agents</span>
+          <span class="session-card-agents">${s.agentCount === 0 ? 'solo' : s.agentCount === 1 ? '1 agent' : s.agentCount + ' agents'}</span>
         </span>
         ${truncDesc ? `<span class="session-card-desc">${this.esc(truncDesc)}</span>` : ''}
         <span class="session-card-detail">${dateStr} ${timeStr}${dur ? ' &middot; ' + dur : ''} &middot; <span style="color:${effColor};font-weight:600">${effStr}</span>${costStr ? ' &middot; <span style="color:#d29922">' + costStr + '</span>' : ''}</span>
