@@ -104,7 +104,7 @@ class TeamsDashboardApp {
       const dur = s.duration ? this.formatDuration(s.duration) : '';
       const project = s.shortProjectName || '';
       const desc = s.sessionDescription || '';
-      const truncDesc = desc.length > 50 ? desc.substring(0, 50) + '...' : desc;
+      const truncDesc = desc.length > 80 ? desc.substring(0, 80) + '...' : desc;
       const eff = s.efficiencyScore;
       const effColor = eff == null ? '#8b949e' : eff >= 70 ? '#3fb950' : eff >= 50 ? '#d29922' : '#f85149';
       const effStr = eff != null ? `${eff}%` : '–';

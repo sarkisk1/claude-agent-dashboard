@@ -196,11 +196,11 @@ class AgentDashboard {
       } catch (e) { /* skip */ }
     }
 
-    // Extract session description from first user message
+    // Extract session description from first meaningful user message
     let sessionDescription = '';
     if (await fs.pathExists(leadFile)) {
       try {
-        const descLines = await this.readFirstNLines(leadFile, 30);
+        const descLines = await this.readFirstNLines(leadFile, 150);
         for (const line of descLines) {
           try {
             const parsed = JSON.parse(line);
@@ -213,21 +213,107 @@ class AgentDashboard {
                   if (block.type === 'text' && block.text) { text = block.text; break; }
                 }
               }
-              if (text.length > 5
-                && !text.startsWith('<system-reminder>')
-                && !text.startsWith('<claude-mem')
-                && !text.startsWith('<command-message')
-                && !text.startsWith('<scheduled-task')
-                && !text.startsWith('<hook-')
-                && !text.startsWith('http://') && !text.startsWith('https://')
-              ) {
-                sessionDescription = text.substring(0, 120).replace(/\n/g, ' ').trim();
-                break;
+
+              // Strip XML-style noise prefixes to find the actual user message
+              text = text.replace(/<ide_opened_file>[\s\S]*?<\/ide_opened_file>\s*/g, '');
+              text = text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>\s*/g, '');
+              text = text.replace(/<claude-mem[^>]*>[\s\S]*?<\/claude-mem[^>]*>\s*/g, '');
+              text = text.replace(/<command-message[^>]*>[\s\S]*?<\/command-message[^>]*>\s*/g, '');
+              text = text.replace(/<local-command-caveat>[\s\S]*?<\/local-command-caveat>\s*/g, '');
+              text = text.replace(/<hook-[^>]*>[\s\S]*?<\/hook-[^>]*>\s*/g, '');
+              text = text.replace(/<scheduled-task[^>]*>[\s\S]*?<\/scheduled-task[^>]*>\s*/g, '');
+              // Strip self-closing or unclosed tags (e.g. <ide_opened_file>...no closing tag)
+              text = text.replace(/<ide_opened_file>[^]*?(?=\n\n|$)/g, '');
+              // Strip any remaining XML tags
+              text = text.replace(/<\/?[a-z_-][^>]*>/gi, '');
+              text = text.trim();
+
+              // Skip if still just noise or too short
+              if (text.length < 10) continue;
+              if (text.startsWith('<')) continue;
+              if (/^https?:\/\//.test(text) && text.length < 60) continue;
+              // Skip claude-mem system prompts
+              if (text.startsWith('You are a Claude-Mem')) continue;
+              if (text.startsWith('You are a specialized')) continue;
+              // Skip image-only messages (screenshots sent to Claude)
+              if (text.startsWith('[Image:')) continue;
+              // Skip observer tool-call log lines
+              if (/^(Grep|Read|Glob|Agent|Edit|Write|Bash|Skill|ToolSearch)\s+\d{4}-/.test(text)) continue;
+              // Skip skill invocation metadata
+              if (text.startsWith('Base directory for this skill:')) continue;
+              // Skip claude-mem progress checkpoints
+              if (text.startsWith('PROGRESS SUMMARY CHECKPOINT')) continue;
+              // Skip interrupted/system messages
+              if (text.startsWith('[Request interrupted')) continue;
+              // Skip agent completion notifications
+              if (/^[a-f0-9]{10,}\s+toolu_/.test(text)) continue;
+              // Skip slash-command-only messages (no context)
+              if (/^\/[a-z-]+$/.test(text.trim())) continue;
+              // Skip Hello/greeting to memory agent
+              if (/^Hello memory agent/.test(text)) continue;
+
+              // Clean up for display
+              text = text.replace(/\s+/g, ' ').trim();
+              sessionDescription = text.substring(0, 150).trim();
+              // Don't cut mid-word
+              if (sessionDescription.length >= 148) {
+                const lastSpace = sessionDescription.lastIndexOf(' ');
+                if (lastSpace > 100) sessionDescription = sessionDescription.substring(0, lastSpace);
               }
+              break;
             }
           } catch (e) { /* skip */ }
         }
       } catch (e) { /* skip */ }
+    }
+
+    // Fallback: if no description found, build one from agent names
+    if (!sessionDescription && agentFiles.length > 0) {
+      const agentNames = [];
+      for (const af of agentFiles.slice(0, 4)) {
+        try {
+          const agentPath = path.join(subagentsDir, af);
+          const agentLines = await this.readFirstNLines(agentPath, 10);
+          for (const al of agentLines) {
+            try {
+              const ap = JSON.parse(al);
+              if (ap.type === 'system' && ap.message?.content) {
+                const sysText = typeof ap.message.content === 'string' ? ap.message.content : '';
+                // Look for agent name/description in system prompt
+                const nameMatch = sysText.match(/(?:You are|Task:|GOAL:?|Description:?)\s*(.{10,80}?)(?:\.|\n|$)/i);
+                if (nameMatch) {
+                  agentNames.push(nameMatch[1].trim());
+                  break;
+                }
+              }
+              // Also check if the first user message has a task description
+              if (ap.type === 'user' && ap.message?.content) {
+                let ut = typeof ap.message.content === 'string' ? ap.message.content : '';
+                if (Array.isArray(ap.message.content)) {
+                  for (const b of ap.message.content) {
+                    if (b.type === 'text' && b.text) { ut = b.text; break; }
+                  }
+                }
+                ut = ut.replace(/<[^>]+>[\s\S]*?<\/[^>]+>/g, '').replace(/<[^>]+>/g, '').trim();
+                if (ut.length > 15 && !ut.startsWith('[Image:') && !ut.startsWith('You are')) {
+                  // Use first line as task summary
+                  const firstLine = ut.split('\n')[0].substring(0, 80).trim();
+                  if (firstLine.length > 15) {
+                    agentNames.push(firstLine);
+                    break;
+                  }
+                }
+              }
+            } catch (e) { /* skip */ }
+          }
+        } catch (e) { /* skip */ }
+      }
+      if (agentNames.length > 0) {
+        sessionDescription = agentNames[0];
+        if (sessionDescription.length > 150) {
+          sessionDescription = sessionDescription.substring(0, 147) + '...';
+        }
+      }
     }
 
     return {
